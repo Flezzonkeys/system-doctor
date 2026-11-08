@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34445f"/>
+      <stop offset="1" stop-color="#121926"/>
+    </linearGradient>
+    <linearGradient id="tileShine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6ff29b"/>
+      <stop offset="0.55" stop-color="#2fc463"/>
+      <stop offset="1" stop-color="#15903f"/>
+    </linearGradient>
+    <linearGradient id="shieldShine" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.55" r="0.5">
+      <stop offset="0" stop-color="#3ddc76" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#3ddc76" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- tile -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#tile)"/>
+  <rect x="6" y="6" width="116" height="58" rx="28" fill="url(#tileShine)"/>
+  <rect x="6.75" y="6.75" width="114.5" height="114.5" rx="27.25" fill="none" stroke="#000000" stroke-opacity="0.35" stroke-width="1.5"/>
+
+  <!-- soft green glow behind the shield -->
+  <circle cx="64" cy="68" r="52" fill="url(#glow)"/>
+
+  <!-- shield shadow -->
+  <path d="M64 25 C76 32 90 35 100 35 V64 C100 87 84 103 64 111 C44 103 28 87 28 64 V35 C38 35 52 32 64 25 Z"
+        fill="#000000" fill-opacity="0.35" transform="translate(0 3)"/>
+  <!-- shield -->
+  <path d="M64 22 C76 29 90 32 100 32 V61 C100 84 84 100 64 108 C44 100 28 84 28 61 V32 C38 32 52 29 64 22 Z"
+        fill="url(#shield)"/>
+  <!-- shield highlight on the upper half -->
+  <path d="M64 26 C75 32.5 88 35.5 96 35.8 V58 C82 63 46 63 32 58 V35.8 C40 35.5 53 32.5 64 26 Z"
+        fill="url(#shieldShine)"/>
+  <path d="M64 22 C76 29 90 32 100 32 V61 C100 84 84 100 64 108 C44 100 28 84 28 61 V32 C38 32 52 29 64 22 Z"
+        fill="none" stroke="#0c6b2c" stroke-opacity="0.6" stroke-width="1.5"/>
+
+  <!-- heartbeat line -->
+  <polyline points="36,66 50,66 56,53 65,82 73,44 79,66 92,66"
+            fill="none" stroke="#0c6b2c" stroke-opacity="0.45" stroke-width="9"
+            stroke-linecap="round" stroke-linejoin="round" transform="translate(0 2)"/>
+  <polyline points="36,66 50,66 56,53 65,82 73,44 79,66 92,66"
+            fill="none" stroke="#ffffff" stroke-width="7"
+            stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

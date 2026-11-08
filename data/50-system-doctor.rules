@@ -1,0 +1,10 @@
+// Lets the user sitting at the computer start a System Doctor check without a password.
+// Only "start" of system-doctor.service is allowed; the check itself only reads system state.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "system-doctor.service" &&
+        action.lookup("verb") == "start" &&
+        subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

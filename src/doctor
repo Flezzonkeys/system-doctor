@@ -1,0 +1,84 @@
+#!/bin/bash
+# doctor: System Doctor in the terminal.
+#   doctor        show the latest health report
+#   doctor now    run a new check and show the result
+#   doctor all    show the latest report with all details
+#   doctor clear  mark the current crash, log and service warnings as seen
+#   doctor gui    open the System Doctor window
+REPORT=/var/lib/system-doctor/report.json
+SERVICE=system-doctor.service
+SEEN="${XDG_CONFIG_HOME:-$HOME/.config}/system-doctor/seen.json"
+
+show() {
+    [ -r "$REPORT" ] || { echo "No check has run yet. Run: doctor now"; return 1; }
+    python3 -I - "$REPORT" "$SEEN" "$([ -t 1 ] && echo color)" "${1:-}" <<'PY'
+import json, os, sys
+from datetime import datetime
+report, seen_file, color, mode = sys.argv[1:5]
+r = json.load(open(report))
+try:
+    seen = set(json.load(open(seen_file)).get("keys", []))
+except (OSError, ValueError, AttributeError):
+    seen = set()
+
+if mode == "clear":
+    keys = {e["key"] for ch in r["checks"] for e in ch.get("events") or []}
+    new = keys - seen
+    os.makedirs(os.path.dirname(seen_file), exist_ok=True)
+    with open(seen_file, "w") as f:
+        json.dump({"keys": sorted(keys & (seen | keys))}, f, indent=1)
+    print(f"Marked {len(new)} warning(s) as seen." if new else "Nothing new to mark as seen.")
+    sys.exit(0)
+
+def effective(ch):
+    ev = ch.get("events") or []
+    if not ev or ch["status"] == "ok":
+        return ch
+    new = [e for e in ev if e["key"] not in seen]
+    if len(new) == len(ev):
+        return ch
+    ch = dict(ch)
+    if not new:
+        ch["status"], ch["seen"] = "ok", True
+        ch["summary"] = f"Nothing new, {len(ev)} marked as seen"
+    else:
+        ch["summary"] = f"{len(new)} new: " + ", ".join(e["label"] for e in new[:3]) + f" ({len(ev) - len(new)} seen)"
+    return ch
+
+checks = [effective(ch) for ch in r["checks"]]
+rank = {"ok": 0, "warn": 1, "fail": 2}
+ov = max((ch["status"] for ch in checks if not ch.get("info")), key=lambda s: rank[s], default="ok")
+c = color == "color"
+col = {"ok": "\033[32m", "warn": "\033[33m", "fail": "\033[31m", "info": "\033[36m", "seen": "\033[90m"} if c else {}
+B, R = ("\033[1m", "\033[0m") if c else ("", "")
+word = {"ok": "OK", "warn": "WARN", "fail": "FAIL", "info": "INFO", "seen": "SEEN"}
+head = {"ok": "Everything looks good", "warn": "Some things need a look", "fail": "Something needs attention now"}
+print(f"{B}System Doctor{R}  -  {col.get(ov,'')}{head[ov]}{R}")
+print(f"Last check: {datetime.fromtimestamp(r['time']):%Y-%m-%d %H:%M}\n")
+for ch in checks:
+    st = "info" if ch.get("info") else "seen" if ch.get("seen") else ch["status"]
+    print(f"  {col.get(st,'')}{'●' if c else '*'} {word[st]:4}{R}  {ch['title']:<13} {ch['summary']}")
+    if mode == "all" or st not in ("ok", "info", "seen"):
+        for d in ch["details"]:
+            print(f"                       {d}")
+if any(e["key"] not in seen for ch in r["checks"] for e in ch.get("events") or []):
+    print("\nSeen these warnings already? Hide them with: doctor clear")
+PY
+}
+
+case ${1:-} in
+    "" ) show ;;
+    all|-a|details) show all ;;
+    clear|seen) show clear ;;
+    now|run|check)
+        if ! systemctl is-active --quiet "$SERVICE"; then
+            systemctl start "$SERVICE" || exit 1
+        else
+            echo "A check is already running, waiting..."
+            while systemctl is-active --quiet "$SERVICE"; do sleep 1; done
+        fi
+        show ;;
+    gui|open) (system-doctor-gui >/dev/null 2>&1 &) ;;
+    help|-h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) echo "Unknown command: $1"; sed -n '3,7p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac

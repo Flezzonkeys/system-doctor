@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily System Doctor health check
+
+[Timer]
+# 10 minutes after boot, then once a day
+OnBootSec=10min
+OnUnitActiveSec=1d
+Persistent=true
+
+[Install]
+WantedBy=timers.target

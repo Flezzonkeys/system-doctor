@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=System Doctor
+GenericName=System Health Check
+Comment=Check the health of drives, temperatures, services, logs and updates
+Exec=/usr/local/bin/system-doctor-gui
+Icon=/usr/local/share/icons/hicolor/scalable/apps/system-doctor.svg
+Terminal=false
+Categories=System;Monitor;
+Keywords=health;smart;drive;disk;check;doctor;temperature;sensors;

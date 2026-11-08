@@ -1,0 +1,10 @@
+[Unit]
+Description=System Doctor health check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/system-doctor
+Nice=10
+IOSchedulingClass=idle

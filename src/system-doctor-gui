@@ -1,0 +1,951 @@
+#!/usr/bin/python3 -I
+"""System Doctor window: a dashboard for the latest health report.
+
+Usage: system-doctor-gui [--theme dark|light] [--report FILE] [--select ID] [--screenshot FILE]
+License: MIT
+"""
+
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from html import escape
+
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import (
+    QColor, QCursor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QShortcut,
+)
+from PyQt6.QtWidgets import (
+    QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QVBoxLayout, QWidget,
+)
+
+VERSION = "2.0.0"
+REPORT = "/var/lib/system-doctor/report.json"
+SERVICE = "system-doctor.service"
+TIMER = "system-doctor.timer"
+
+WORDS = {"ok": "OK", "warn": "Warning", "fail": "Problem", "info": "Info", "seen": "Seen"}
+HEADLINES = {
+    "ok": "Everything looks good",
+    "warn": "Some things need a look",
+    "fail": "Something needs attention now",
+}
+ICONS = {
+    "sysinfo": ["computer"],
+    "resources": ["utilities-system-monitor", "speedometer"],
+    "drives": ["drive-harddisk-solidstate", "drive-harddisk"],
+    "btrfs": ["drive-multidisk", "drive-harddisk"],
+    "space": ["drive-harddisk", "folder"],
+    "temps": ["temperature", "sensors-temperature", "cpu"],
+    "services": ["applications-system", "system-run"],
+    "crashes": ["tools-report-bug", "dialog-error"],
+    "logs": ["utilities-log-viewer", "text-x-generic"],
+    "updates": ["system-software-update", "package-x-generic"],
+    "maintenance": ["package-x-generic", "applications-utilities"],
+}
+
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "system-doctor")
+SETTINGS = os.path.join(CONFIG_DIR, "gui.json")
+SEEN = os.path.join(CONFIG_DIR, "seen.json")
+RANK = {"ok": 0, "warn": 1, "fail": 2}
+
+# Colour themes (window, text, base, button, highlight, disabled text)
+THEMES = {
+    "dark": {"Window": "#1b1e22", "WindowText": "#e6e8eb", "Base": "#24282d", "AlternateBase": "#2a2e34",
+             "Text": "#e6e8eb", "Button": "#2e333a", "ButtonText": "#e6e8eb", "Highlight": "#3d8fe0",
+             "HighlightedText": "#ffffff", "ToolTipBase": "#2e333a", "ToolTipText": "#e6e8eb",
+             "PlaceholderText": "#8a9099", "Link": "#58a6ff", "Light": "#3d434b", "Midlight": "#353a41",
+             "Mid": "#2a2e34", "Dark": "#141619", "Shadow": "#0b0c0e", "Disabled": "#6b7179"},
+    "light": {"Window": "#f2f3f5", "WindowText": "#1d2125", "Base": "#ffffff", "AlternateBase": "#f6f7f9",
+              "Text": "#1d2125", "Button": "#f8f9fa", "ButtonText": "#1d2125", "Highlight": "#2f6fca",
+              "HighlightedText": "#ffffff", "ToolTipBase": "#ffffff", "ToolTipText": "#1d2125",
+              "PlaceholderText": "#8a9099", "Link": "#2f6fca", "Light": "#ffffff", "Midlight": "#eceef1",
+              "Mid": "#c5cad1", "Dark": "#9da3ab", "Shadow": "#6b7179", "Disabled": "#9da3ab"},
+}
+
+
+def make_palette(name):
+    t = THEMES[name]
+    p = QPalette()
+    for role, value in t.items():
+        if role != "Disabled":
+            p.setColor(getattr(QPalette.ColorRole, role), QColor(value))
+    for role in ("WindowText", "Text", "ButtonText"):
+        p.setColor(QPalette.ColorGroup.Disabled, getattr(QPalette.ColorRole, role), QColor(t["Disabled"]))
+    return p
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_seen():
+    return set(load_json(SEEN, {}).get("keys", []))
+
+
+def save_seen(keys, report_checks):
+    """Store seen keys, dropping those that are no longer in the report so the file stays small."""
+    current = {e["key"] for c in report_checks for e in c.get("events") or []}
+    save_json(SEEN, {"keys": sorted(k for k in keys if k in current)})
+
+
+def effective(check, seen):
+    """The check as the user should see it, with events they marked as seen taken out."""
+    events = check.get("events") or []
+    if not events or check.get("status") == "ok":
+        return check
+    new = [e for e in events if e["key"] not in seen]
+    if len(new) == len(events):
+        return check
+    c = dict(check)
+    c["seen_count"] = len(events) - len(new)
+    if not new:
+        c["status"] = "ok"
+        c["seen"] = True
+        c["summary"] = f"Nothing new, {len(events)} marked as seen"
+    else:
+        labels = ", ".join(e["label"] for e in new[:3]) + (" ..." if len(new) > 3 else "")
+        c["summary"] = f"{len(new)} new: {labels} ({c['seen_count']} seen)"
+    return c
+
+
+def unseen_keys(check, seen):
+    return [e["key"] for e in check.get("events") or [] if e["key"] not in seen]
+
+
+# ---------------------------------------------------------------- helpers
+def is_dark():
+    return QApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def status_color(status):
+    dark = is_dark()
+    return QColor({
+        "ok": "#3fb950" if dark else "#1f8f3a",
+        "warn": "#e3b341" if dark else "#c27c00",
+        "fail": "#f85149" if dark else "#cf2e25",
+        "info": "#58a6ff" if dark else "#2f6fca",
+        "seen": "#8b949e" if dark else "#6e7781",
+    }.get(status, "#888888"))
+
+
+def mix(a, b, t):
+    """Blend colour a towards b by t (0..1)."""
+    return QColor(round(a.red() + (b.red() - a.red()) * t), round(a.green() + (b.green() - a.green()) * t),
+                  round(a.blue() + (b.blue() - a.blue()) * t))
+
+
+def pal(role):
+    return QApplication.palette().color(role)
+
+
+def muted():
+    return mix(pal(QPalette.ColorRole.WindowText), pal(QPalette.ColorRole.Window), 0.45)
+
+
+def theme_icon(cid):
+    for name in ICONS.get(cid, []) + ["application-x-executable"]:
+        if QIcon.hasThemeIcon(name):
+            return QIcon.fromTheme(name)
+    return QIcon()
+
+
+def shown_status(check):
+    if check.get("info"):
+        return "info"
+    return "seen" if check.get("seen") else check.get("status", "ok")
+
+
+def fmt_time(ts):
+    dt = datetime.fromtimestamp(ts)
+    days = (datetime.now().date() - dt.date()).days
+    day = "today" if days == 0 else "yesterday" if days == 1 else \
+        "tomorrow" if days == -1 else dt.strftime("%b %d, %Y")
+    return f"{day}, {dt.strftime('%H:%M')}"
+
+
+def systemctl(*args):
+    try:
+        return subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def is_running():
+    return systemctl("is-active", SERVICE) in ("active", "activating")
+
+
+def next_run():
+    try:
+        timers = json.loads(systemctl("list-timers", TIMER, "--output=json") or "[]")
+        nxt = timers[0].get("next") if timers else None
+        return nxt / 1e6 if nxt else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def status_word(check):
+    return WORDS.get(shown_status(check))
+
+
+def plain_text(check):
+    lines = [f"{check.get('title')}: {status_word(check)} - {check.get('summary')}"]
+    lines += ["  " + d for d in check.get("details", [])]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- small widgets
+class StatusBadge(QWidget):
+    """Round badge with a check mark, exclamation mark or cross."""
+
+    def __init__(self, size=56):
+        super().__init__()
+        self.status = "ok"
+        self.setFixedSize(size, size)
+
+    def set_status(self, status):
+        self.status = status
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = status_color(self.status)
+        r = QRectF(2, 2, self.width() - 4, self.height() - 4)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(r)
+        pen = QPen(QColor("white"), self.width() * 0.09, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                   Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        w = self.width()
+        if self.status == "ok":
+            path = QPainterPath(QPointF(w * 0.29, w * 0.52))
+            path.lineTo(w * 0.44, w * 0.66)
+            path.lineTo(w * 0.72, w * 0.36)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+        elif self.status == "warn":
+            p.drawLine(QPointF(w / 2, w * 0.27), QPointF(w / 2, w * 0.56))
+            p.drawPoint(QPointF(w / 2, w * 0.73))
+        else:
+            p.drawLine(QPointF(w * 0.34, w * 0.34), QPointF(w * 0.66, w * 0.66))
+            p.drawLine(QPointF(w * 0.66, w * 0.34), QPointF(w * 0.34, w * 0.66))
+
+
+class Pill(QLabel):
+    """Small rounded status label."""
+
+    def __init__(self):
+        super().__init__()
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = self.font()
+        f.setBold(True)
+        f.setPointSizeF(f.pointSizeF() * 0.85)
+        self.setFont(f)
+
+    def set_status(self, status, text=None):
+        c = status_color(status)
+        bg = mix(c, pal(QPalette.ColorRole.Base), 0.82)
+        self.setText(text or WORDS.get(status, status))
+        self.setStyleSheet(f"QLabel {{ color: {c.name()}; background: {bg.name()}; border: 1px solid "
+                           f"{mix(c, pal(QPalette.ColorRole.Base), 0.5).name()}; border-radius: 9px; "
+                           f"padding: 1px 9px; }}")
+
+
+class GaugeBar(QWidget):
+    """Horizontal fill bar, coloured by the thresholds from the report."""
+
+    def __init__(self, gauge, compact=False):
+        super().__init__()
+        self.g = gauge
+        self.compact = compact
+        self.setFixedHeight(6 if compact else 30)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def level(self):
+        v = self.g["value"]
+        if "fail" in self.g and v >= self.g["fail"]:
+            return "fail"
+        if "warn" in self.g and v >= self.g["warn"]:
+            return "warn"
+        return "ok" if "warn" in self.g else "info"
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        base = pal(QPalette.ColorRole.Base)
+        track = mix(pal(QPalette.ColorRole.WindowText), base, 0.88)
+        bar_h = 6 if self.compact else 8
+        y = self.height() - bar_h
+        if not self.compact:
+            p.setPen(pal(QPalette.ColorRole.WindowText))
+            p.drawText(QRectF(0, 0, self.width(), y - 2), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
+                       self.g["label"])
+            p.setPen(muted())
+            p.drawText(QRectF(0, 0, self.width(), y - 2), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+                       f"{self.g['value']:.0f}%")
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, y, self.width(), bar_h), bar_h / 2, bar_h / 2)
+        fill = self.width() * self.g["value"] / 100
+        if fill > 0:
+            p.setBrush(status_color(self.level()))
+            p.drawRoundedRect(QRectF(0, y, max(fill, bar_h), bar_h), bar_h / 2, bar_h / 2)
+
+
+# ---------------------------------------------------------------- cards
+class Card(QFrame):
+    clicked = pyqtSignal(str)
+
+    HEIGHT = 92
+
+    def __init__(self, check):
+        super().__init__()
+        self.cid = check["id"]
+        self.selected = False
+        self.hover = False
+        self.setFixedHeight(self.HEIGHT)
+        self.setMinimumWidth(220)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self.icon = QLabel()
+        self.title = QLabel()
+        tf = self.title.font()
+        tf.setBold(True)
+        tf.setPointSizeF(tf.pointSizeF() * 1.08)
+        self.title.setFont(tf)
+        self.pill = Pill()
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self.gauge_box = QVBoxLayout()
+        self.gauge_box.setContentsMargins(0, 0, 0, 0)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.addWidget(self.icon)
+        top.addWidget(self.title, 1)
+        top.addWidget(self.pill)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 10, 12, 10)
+        lay.setSpacing(4)
+        lay.addLayout(top)
+        lay.addWidget(self.summary, 1)
+        lay.addLayout(self.gauge_box)
+        self.set_check(check)
+
+    def set_check(self, check):
+        self.check = check
+        st = shown_status(check)
+        self.icon.setPixmap(theme_icon(self.cid).pixmap(QSize(24, 24)))
+        self.title.setText(check.get("title", ""))
+        self.pill.set_status(st)
+        self.summary.setStyleSheet(f"color: {muted().name()};")
+        self.full_summary = check.get("summary", "")
+        self.setToolTip(self.full_summary)
+        while self.gauge_box.count():
+            self.gauge_box.takeAt(0).widget().deleteLater()
+        gauges = check.get("gauges") or []
+        if gauges:
+            # The fullest bar is the most interesting one for the overview
+            self.gauge_box.addWidget(GaugeBar(max(gauges, key=lambda g: g["value"]) if self.cid == "space"
+                                              else gauges[0], compact=True))
+        self.elide()
+        self.update()
+
+    def elide(self):
+        """Fit the summary into the lines that are free on the card."""
+        lines = 1 if self.check.get("gauges") else 2
+        fm = QFontMetrics(self.summary.font())
+        width = max(self.summary.width(), 50)
+        text, out = self.full_summary, []
+        for i in range(lines):
+            if i == lines - 1:
+                out.append(fm.elidedText(text, Qt.TextElideMode.ElideRight, width))
+                break
+            # break at the last space that still fits
+            cut = len(text)
+            while cut > 0 and fm.horizontalAdvance(text[:cut]) > width:
+                cut = text.rfind(" ", 0, cut)
+            if cut <= 0:
+                cut = len(text)
+            out.append(text[:cut])
+            text = text[cut:].lstrip()
+            if not text:
+                break
+        self.summary.setText("\n".join(out))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.elide()
+
+    def set_selected(self, on):
+        self.selected = on
+        self.update()
+
+    def enterEvent(self, _):
+        self.hover = True
+        self.update()
+
+    def leaveEvent(self, _):
+        self.hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.cid)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            self.clicked.emit(self.cid)
+        else:
+            super().keyPressEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        base = pal(QPalette.ColorRole.Base)
+        text = pal(QPalette.ColorRole.WindowText)
+        st = shown_status(self.check)
+        c = status_color(st)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        bg = mix(base, c, 0.07) if st in ("warn", "fail") else base
+        if self.hover and self.rect().contains(self.mapFromGlobal(QCursor.pos())):
+            bg = mix(bg, text, 0.04)
+        path = QPainterPath()
+        path.addRoundedRect(r, 8, 8)
+        p.fillPath(path, bg)
+        # status stripe on the left
+        p.save()
+        p.setClipPath(path)
+        p.fillRect(QRectF(r.left(), r.top(), 5, r.height()), c)
+        p.restore()
+        if self.selected:
+            p.setPen(QPen(pal(QPalette.ColorRole.Highlight), 2))
+        elif self.hasFocus():
+            p.setPen(QPen(mix(pal(QPalette.ColorRole.Highlight), base, 0.4), 1.5))
+        else:
+            p.setPen(QPen(mix(text, base, 0.82), 1))
+        p.drawPath(path)
+
+
+class CardGrid(QWidget):
+    """Cards in as many columns as fit the width."""
+
+    def __init__(self):
+        super().__init__()
+        self.cards = []
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 4, 0)
+        self.grid.setSpacing(12)
+        self.cols = 0
+
+    def set_cards(self, cards):
+        for c in self.cards:
+            if c not in cards:
+                c.setParent(None)
+                c.deleteLater()
+        self.cards = cards
+        self.cols = 0
+        self.relayout()
+
+    def relayout(self):
+        cols = max(1, min(3, (self.width() + 12) // (Card.HEIGHT * 2 + 52)))
+        if cols == self.cols and self.grid.count() == len(self.cards):
+            return
+        self.cols = cols
+        while self.grid.count():
+            self.grid.takeAt(0)
+        for i, c in enumerate(self.cards):
+            self.grid.addWidget(c, i // cols, i % cols)
+        for col in range(3):
+            self.grid.setColumnStretch(col, 1 if col < cols else 0)
+        self.grid.setRowStretch(len(self.cards) // cols + 1, 1)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.relayout()
+
+
+# ---------------------------------------------------------------- detail panel
+class DetailPanel(QFrame):
+    seen_changed = pyqtSignal(list, bool)  # event keys, True = mark as seen
+
+    def __init__(self):
+        super().__init__()
+        self.check = None
+        self.seen_keys = []
+        self.seen_mode = True
+        self.setMinimumWidth(340)
+        self.setObjectName("detail")
+
+        self.icon = QLabel()
+        self.title = QLabel()
+        tf = self.title.font()
+        tf.setBold(True)
+        tf.setPointSizeF(tf.pointSizeF() * 1.35)
+        self.title.setFont(tf)
+        self.pill = Pill()
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.gauges = QVBoxLayout()
+        self.gauges.setSpacing(6)
+        self.body = QLabel()
+        self.body.setWordWrap(True)
+        self.body.setTextFormat(Qt.TextFormat.RichText)
+        self.body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.body.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.copy_btn = QPushButton(QIcon.fromTheme("edit-copy"), "Copy")
+        self.copy_btn.setToolTip("Copy this section as text")
+        self.copy_btn.clicked.connect(self.copy)
+        self.seen_btn = QPushButton()
+        self.seen_btn.clicked.connect(lambda: self.seen_changed.emit(self.seen_keys, self.seen_mode))
+        self.line = QFrame()
+        self.line.setFrameShape(QFrame.Shape.HLine)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        head.addWidget(self.icon)
+        head.addWidget(self.title, 1)
+        head.addWidget(self.pill)
+
+        inner = QWidget()
+        il = QVBoxLayout(inner)
+        il.setContentsMargins(0, 0, 8, 0)
+        il.setSpacing(12)
+        il.addWidget(self.summary)
+        il.addLayout(self.gauges)
+        il.addWidget(self.body)
+        il.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(inner)
+        scroll.viewport().setAutoFillBackground(False)
+        inner.setAutoFillBackground(False)
+
+        foot = QHBoxLayout()
+        foot.addWidget(self.seen_btn)
+        foot.addStretch(1)
+        foot.addWidget(self.copy_btn)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 16, 12)
+        lay.setSpacing(12)
+        lay.addLayout(head)
+        lay.addWidget(self.line)
+        lay.addWidget(scroll, 1)
+        lay.addLayout(foot)
+
+    def show_check(self, check, seen):
+        self.check = check
+        st = shown_status(check)
+        self.line.setStyleSheet(f"color: {mix(pal(QPalette.ColorRole.WindowText), pal(QPalette.ColorRole.Base), 0.85).name()};")
+        new = unseen_keys(check, seen)
+        if new:
+            self.seen_keys, self.seen_mode = new, True
+            self.seen_btn.setIcon(QIcon.fromTheme("dialog-ok-apply", QIcon.fromTheme("dialog-ok")))
+            self.seen_btn.setText("Mark as seen" if len(new) == 1 else f"Mark {len(new)} as seen")
+            self.seen_btn.setToolTip("Hide this warning until something new happens")
+        elif check.get("seen_count"):
+            self.seen_btn.setIcon(QIcon.fromTheme("edit-undo"))
+            self.seen_keys, self.seen_mode = [e["key"] for e in check.get("events", [])], False
+            self.seen_btn.setText("Show again")
+            self.seen_btn.setToolTip("Show the warnings you marked as seen again")
+        self.seen_btn.setVisible(bool(new) or bool(check.get("seen_count")))
+        self.icon.setPixmap(theme_icon(check["id"]).pixmap(QSize(32, 32)))
+        self.title.setText(check.get("title", ""))
+        self.pill.set_status(st)
+        self.summary.setText(check.get("summary", ""))
+        while self.gauges.count():
+            self.gauges.takeAt(0).widget().deleteLater()
+        for g in check.get("gauges") or []:
+            self.gauges.addWidget(GaugeBar(g))
+        self.body.setText(self.render(check.get("details", [])))
+
+    @staticmethod
+    def render(details):
+        """Details as a table: 'Key: value' rows, indented lines as sub rows, the rest as notes."""
+        mc = muted().name()
+        rows = []
+        for i, d in enumerate(details):
+            if d.startswith("    "):
+                rows.append(f"<tr><td colspan='2' style='color:{mc}; padding:1px 0 1px 16px'>{escape(d.strip())}</td></tr>")
+                continue
+            key, sep, val = d.partition(": ")
+            has_children = i + 1 < len(details) and details[i + 1].startswith("    ")
+            if has_children and not d.endswith(":"):
+                text = f"<b>{escape(key)}</b>" + (f"&nbsp;&nbsp;{escape(val)}" if sep else "")
+                rows.append(f"<tr><td colspan='2' style='padding:8px 0 1px 0'>{text}</td></tr>")
+            elif sep and len(key) <= 34 and val:
+                rows.append(f"<tr><td width='1%' style='color:{mc}; padding:5px 14px 1px 0; white-space:nowrap' valign='top'>"
+                            f"{escape(key)}</td><td style='padding:5px 0 1px 0'>{escape(val)}</td></tr>")
+            elif d.endswith(":"):
+                rows.append(f"<tr><td colspan='2' style='padding:8px 0 1px 0'><b>{escape(d[:-1])}</b></td></tr>")
+            else:
+                rows.append(f"<tr><td colspan='2' style='color:{mc}; padding:8px 0 1px 0'><i>{escape(d)}</i></td></tr>")
+        if not rows:
+            return f"<span style='color:{mc}'>No further details.</span>"
+        return "<table width='100%' cellspacing='0' cellpadding='0'>" + "".join(rows) + "</table>"
+
+    def copy(self):
+        if self.check:
+            QApplication.clipboard().setText(plain_text(self.check))
+            self.copy_btn.setText("Copied")
+            QTimer.singleShot(1500, lambda: self.copy_btn.setText("Copy"))
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        base = pal(QPalette.ColorRole.Base)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(r, 8, 8)
+        p.fillPath(path, base)
+        p.setPen(QPen(mix(pal(QPalette.ColorRole.WindowText), base, 0.82), 1))
+        p.drawPath(path)
+
+
+# ---------------------------------------------------------------- header
+class Header(QFrame):
+    def __init__(self):
+        super().__init__()
+        self.status = "ok"
+        self.badge = StatusBadge()
+        self.headline = QLabel()
+        hf = self.headline.font()
+        hf.setBold(True)
+        hf.setPointSizeF(hf.pointSizeF() * 1.6)
+        self.headline.setFont(hf)
+        self.subline = QLabel()
+        self.machine = QLabel()
+        self.counts = QHBoxLayout()
+        self.counts.setSpacing(6)
+
+        self.run_btn = QPushButton(QIcon.fromTheme("view-refresh"), "Run check now")
+        self.run_btn.setToolTip("Run all checks again (F5)")
+        self.run_btn.setMinimumHeight(34)
+        self.run_btn.setMinimumWidth(150)
+        self.theme_btn = QPushButton()
+        self.theme_btn.setMinimumHeight(34)
+        self.seen_all_btn = QPushButton(QIcon.fromTheme("dialog-ok-apply", QIcon.fromTheme("dialog-ok")),
+                                        "Mark all as seen")
+        self.seen_all_btn.setToolTip("Hide all current crash, log and service warnings until something new happens")
+        self.seen_all_btn.setMinimumHeight(34)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(self.headline)
+        text.addWidget(self.subline)
+        text.addWidget(self.machine)
+
+        right = QVBoxLayout()
+        right.setSpacing(8)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
+        buttons.addWidget(self.theme_btn)
+        buttons.addWidget(self.seen_all_btn)
+        buttons.addWidget(self.run_btn)
+        right.addLayout(buttons)
+        right.addLayout(self.counts)
+        right.addStretch(1)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(16)
+        lay.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addLayout(text, 1)
+        lay.addLayout(right)
+
+    def set_counts(self, counts):
+        while self.counts.count():
+            item = self.counts.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.counts.addStretch(1)
+        for st, word in (("ok", "OK"), ("warn", "warning"), ("fail", "problem")):
+            n = counts.get(st, 0)
+            if n or st == "ok":
+                pill = Pill()
+                pill.set_status(st, f"{n} {word}" + ("s" if n != 1 and st != "ok" else ""))
+                self.counts.addWidget(pill)
+
+    def set_dark(self, dark):
+        self.theme_btn.setText("Light mode" if dark else "Dark mode")
+        self.theme_btn.setIcon(QIcon.fromTheme("weather-clear" if dark else "weather-clear-night"))
+        self.theme_btn.setToolTip(f"Switch to the {'light' if dark else 'dark'} theme (Ctrl+T)")
+
+    def set_status(self, status):
+        self.status = status
+        self.badge.set_status(status)
+        self.headline.setStyleSheet(f"color: {status_color(status).name()};")
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        base = pal(QPalette.ColorRole.Base)
+        c = status_color(self.status)
+        r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        path = QPainterPath()
+        path.addRoundedRect(r, 10, 10)
+        p.fillPath(path, mix(base, c, 0.10))
+        p.setPen(QPen(mix(base, c, 0.35), 1))
+        p.drawPath(path)
+
+
+# ---------------------------------------------------------------- window
+class Window(QWidget):
+    def __init__(self, report_path, theme):
+        super().__init__()
+        self.report_path = report_path
+        self.theme = theme
+        self.report = None
+        self.seen = load_seen()
+        self.setWindowTitle("System Doctor")
+        # Loaded by path: some icon themes would otherwise pick a similar named icon ("system")
+        icon_file = "/usr/local/share/icons/hicolor/scalable/apps/system-doctor.svg"
+        self.setWindowIcon(QIcon(icon_file) if os.path.exists(icon_file) else QIcon.fromTheme("utilities-system-monitor"))
+        self.resize(1120, 760)
+        self.setMinimumSize(760, 540)
+        self._mtime = None
+        self._running = False
+        self.cards = {}
+        self.selected = None
+
+        self.header = Header()
+        self.header.run_btn.clicked.connect(self.run_check)
+        self.header.theme_btn.clicked.connect(self.toggle_theme)
+        self.header.seen_all_btn.clicked.connect(self.mark_all_seen)
+        self.header.set_dark(theme == "dark")
+
+        self.grid = CardGrid()
+        grid_scroll = QScrollArea()
+        grid_scroll.setWidgetResizable(True)
+        grid_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        grid_scroll.setWidget(self.grid)
+        grid_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.detail = DetailPanel()
+        self.detail.seen_changed.connect(self.set_seen)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(grid_scroll)
+        self.splitter.addWidget(self.detail)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(12)
+        self.splitter.setSizes([680, 420])
+
+        self.empty = QLabel("No check has run yet.\nClick \"Run check now\" to start the first check.")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ef = self.empty.font()
+        ef.setPointSizeF(ef.pointSizeF() * 1.2)
+        self.empty.setFont(ef)
+
+        self.footer = QLabel()
+        self.footer.setStyleSheet(f"color: {muted().name()};")
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 8)
+        lay.setSpacing(12)
+        lay.addWidget(self.header)
+        lay.addWidget(self.splitter, 1)
+        lay.addWidget(self.empty, 1)
+        lay.addWidget(self.footer)
+
+        QShortcut(QKeySequence("F5"), self, activated=self.run_check)
+        QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.close)
+        QShortcut(QKeySequence("Ctrl+C"), self, activated=self.detail.copy)
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.toggle_theme)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(1500)
+        self.refresh()
+
+    # ------------------------------------------------------------ data
+    def refresh(self):
+        running = is_running() if self.report_path == REPORT else False
+        changed_run = running != self._running
+        self._running = running
+        btn = self.header.run_btn
+        btn.setEnabled(not running and self.report_path == REPORT)
+        btn.setText("Checking..." if running else "Run check now")
+
+        try:
+            mtime = os.path.getmtime(self.report_path)
+        except OSError:
+            self.show_empty(True)
+            self.header.set_status("warn")
+            self.header.headline.setText("No report yet")
+            self.header.subline.setText("Checking..." if running else "System Doctor has not run a check yet.")
+            return
+        if mtime == self._mtime and not changed_run:
+            return
+        self._mtime = mtime
+        try:
+            with open(self.report_path, encoding="utf-8") as f:
+                report = json.load(f)
+        except (OSError, ValueError):
+            return
+        self.show_empty(False)
+        self.report = report
+        self.apply(report, running)
+
+    def show_empty(self, on):
+        self.empty.setVisible(on)
+        self.splitter.setVisible(not on)
+
+    def apply(self, report, running):
+        raw = report.get("checks", [])
+        checks = [effective(c, self.seen) for c in raw]
+        overall = "ok"
+        for c in checks:
+            if not c.get("info") and RANK.get(c["status"], 0) > RANK[overall]:
+                overall = c["status"]
+        self.header.seen_all_btn.setVisible(any(unseen_keys(c, self.seen) for c in raw))
+        self.footer.setStyleSheet(f"color: {muted().name()};")
+        self.header.set_status(overall)
+        self.header.headline.setText(HEADLINES.get(overall, ""))
+        sub = f"Last check: {fmt_time(report.get('time', 0))}"
+        nxt = next_run() if self.report_path == REPORT else None
+        if running:
+            sub += "   |   running a new check..."
+        elif nxt:
+            sub += f"   |   next check: {fmt_time(nxt)}"
+        self.header.subline.setText(sub)
+        sysinfo = next((c for c in checks if c["id"] == "sysinfo"), None)
+        self.header.machine.setText(sysinfo["summary"] if sysinfo else "")
+        self.header.machine.setStyleSheet(f"color: {muted().name()};")
+        counts = {}
+        for c in checks:
+            if not c.get("info"):
+                counts[c["status"]] = counts.get(c["status"], 0) + 1
+        self.header.set_counts(counts)
+
+        cards = []
+        for c in checks:
+            card = self.cards.get(c["id"])
+            if card:
+                card.set_check(c)
+            else:
+                card = Card(c)
+                card.clicked.connect(self.select)
+                self.cards[c["id"]] = card
+            cards.append(card)
+        ids = {c["id"] for c in checks}
+        self.cards = {k: v for k, v in self.cards.items() if k in ids}
+        self.grid.set_cards(cards)
+
+        if self.selected not in ids:
+            problem = next((c["id"] for c in checks if not c.get("info") and c["status"] != "ok"), None)
+            self.selected = problem or (checks[0]["id"] if checks else None)
+        if self.selected:
+            self.select(self.selected)
+
+        version = report.get("version", "")
+        self.footer.setText(f"System Doctor {VERSION}" + (f"  (checker {version})" if version and version != VERSION
+                                                           else "") +
+                            "   |   checks run automatically 10 minutes after boot and once a day   |   F5 to check now")
+
+    def select(self, cid):
+        self.selected = cid
+        for k, card in self.cards.items():
+            card.set_selected(k == cid)
+        if cid in self.cards:
+            self.detail.show_check(self.cards[cid].check, self.seen)
+
+    # ------------------------------------------------------------ actions
+    def reapply(self):
+        if self.report:
+            self.apply(self.report, self._running)
+        for w in self.findChildren(QWidget):
+            w.update()
+
+    def set_seen(self, keys, add):
+        self.seen = (self.seen | set(keys)) if add else (self.seen - set(keys))
+        save_seen(self.seen, (self.report or {}).get("checks", []))
+        self.reapply()
+
+    def mark_all_seen(self):
+        keys = [k for c in (self.report or {}).get("checks", []) for k in unseen_keys(c, self.seen)]
+        self.set_seen(keys, True)
+
+    def toggle_theme(self):
+        self.theme = "light" if self.theme == "dark" else "dark"
+        QApplication.instance().setPalette(make_palette(self.theme))
+        settings = load_json(SETTINGS, {})
+        settings["theme"] = self.theme
+        save_json(SETTINGS, settings)
+        self.header.set_dark(self.theme == "dark")
+        self.reapply()
+
+    def run_check(self):
+        if self._running or self.report_path != REPORT:
+            return
+        self.header.run_btn.setEnabled(False)
+        self.header.run_btn.setText("Checking...")
+        p = subprocess.run(["systemctl", "start", "--no-block", SERVICE], capture_output=True, text=True)
+        if p.returncode != 0:
+            QMessageBox.warning(self, "System Doctor", "Could not start the check:\n" + p.stderr.strip())
+        QTimer.singleShot(400, self.refresh)
+
+
+def main():
+    args = sys.argv[1:]
+    report = REPORT
+    shot = None
+    if "--report" in args and args.index("--report") + 1 < len(args):
+        report = args[args.index("--report") + 1]
+    if "--screenshot" in args and args.index("--screenshot") + 1 < len(args):
+        shot = args[args.index("--screenshot") + 1]
+    pick = args[args.index("--select") + 1] if "--select" in args and args.index("--select") + 1 < len(args) else None
+    if "--version" in args:
+        print(f"system-doctor-gui {VERSION}")
+        return
+    theme = load_json(SETTINGS, {}).get("theme", "dark")
+    if "--theme" in args and args.index("--theme") + 1 < len(args):
+        theme = args[args.index("--theme") + 1]
+    theme = theme if theme in THEMES else "dark"
+    app = QApplication(sys.argv[:1])
+    app.setApplicationName("System Doctor")
+    app.setDesktopFileName("system-doctor")
+    # Fusion draws everything from our palette, so both themes look the same on every desktop
+    app.setStyle("Fusion")
+    app.setPalette(make_palette(theme))
+    w = Window(report, theme)
+    w.show()
+    if pick:
+        w.select(pick)
+    if shot:
+        QTimer.singleShot(1200, lambda: (w.grab().save(shot), app.quit()))
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

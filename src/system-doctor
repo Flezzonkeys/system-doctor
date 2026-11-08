@@ -1,0 +1,810 @@
+#!/usr/bin/python3 -I
+"""System Doctor: daily health check for Arch-based Linux systems.
+
+Runs as root (via system-doctor.service), writes a JSON report to
+/var/lib/system-doctor/report.json and sends a desktop notification
+to logged-in users when new problems show up.
+
+License: MIT
+"""
+
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = "2.0.0"
+STATE_DIR = "/var/lib/system-doctor"
+REPORT = os.path.join(STATE_DIR, "report.json")
+# Login screen accounts: their crashes during logout/login are harmless and ignored
+DISPLAY_MANAGER_USERS = ("sddm", "gdm", "lightdm", "greeter", "greetd")
+
+OK, WARN, FAIL = "ok", "warn", "fail"
+RANK = {OK: 0, WARN: 1, FAIL: 2}
+
+
+def run(*args, timeout=60):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 255, "", str(e)
+
+
+def worst(*states):
+    return max(states, key=lambda s: RANK[s]) if states else OK
+
+
+def result(cid, title, status, summary, details=None, keys=None, info=False, events=None):
+    r = {"id": cid, "title": title, "status": status, "summary": summary, "details": details or []}
+    if events:
+        # Single findings (a crash, a failed service, ...) that the user can mark as seen.
+        # A check whose warning only comes from its events counts as OK once all events are seen.
+        r["events"] = events
+        keys = [e["key"] for e in events]
+    if keys is not None:
+        r["keys"] = keys  # identifies individual events (e.g. crashes) to detect new ones
+    if info:
+        r["info"] = True  # pure information, never a problem
+    return r
+
+
+def read(path, default=""):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def duration(seconds):
+    m = int(seconds) // 60
+    d, h, m = m // 1440, m // 60 % 24, m % 60
+    if d:
+        return f"{d} day{'s' if d != 1 else ''} {h} h"
+    if h:
+        return f"{h} h {m} min"
+    return f"{m} min"
+
+
+def pkg_version(name):
+    rc, out, _ = run("pacman", "-Q", name)
+    if rc != 0 or len(out.split()) < 2:
+        return None
+    return out.split()[1].split(":")[-1].rsplit("-", 1)[0]  # strip epoch and pkgrel
+
+
+def desktop_users():
+    """Logged-in users with a running session bus: [(name, uid)]."""
+    users = []
+    for bus in sorted(os.listdir("/run/user")) if os.path.isdir("/run/user") else []:
+        if bus.isdigit() and int(bus) >= 1000 and os.path.exists(f"/run/user/{bus}/bus"):
+            try:
+                users.append((pwd.getpwuid(int(bus)).pw_name, int(bus)))
+            except KeyError:
+                pass
+    return users
+
+
+def gauge(label, percent, warn_at=None, fail_at=None):
+    """A fill bar for the GUI (0-100) with the thresholds it is judged by."""
+    g = {"label": label, "value": max(0.0, min(100.0, round(float(percent), 1)))}
+    if warn_at is not None:
+        g["warn"] = warn_at
+    if fail_at is not None:
+        g["fail"] = fail_at
+    return g
+
+
+def human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def ago(seconds):
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} h ago"
+    return f"{seconds // 86400} days ago"
+
+
+# ---------------------------------------------------------------- system info
+def list_gpus():
+    _, out, _ = run("lspci", "-D", "-mm")
+    gpus = []
+    for line in out.splitlines():
+        try:
+            parts = [p for p in shlex.split(line) if not re.fullmatch(r"-[rp]\w+", p)]
+        except ValueError:
+            continue
+        if len(parts) < 4 or parts[1] not in ("VGA compatible controller", "3D controller", "Display controller"):
+            continue
+        slot, _, vendor, device = parts[:4]
+        sub = parts[4] if len(parts) > 4 else ""
+        m = re.search(r"\[([^\]]+)\]\s*$", device)
+        name = m.group(1) if m else device
+        for short in ("AMD", "NVIDIA", "Intel"):
+            if short in vendor:
+                vendor = short
+        vram = read(f"/sys/bus/pci/devices/{slot}/mem_info_vram_total")
+        drv = os.path.basename(os.path.realpath(f"/sys/bus/pci/devices/{slot}/driver"))
+        gpus.append({"name": f"{vendor} {name}", "maker": sub, "vram": int(vram) if vram.isdigit() else 0,
+                     "driver": drv if drv != "driver" else ""})
+    return sorted(gpus, key=lambda g: -g["vram"])
+
+
+def memory_modules():
+    _, out, _ = run("dmidecode", "-t", "17")
+    mods = []
+    for block in out.split("\n\n"):
+        if "Memory Device" not in block:
+            continue
+        f = {}
+        for line in block.splitlines():
+            k, sep, v = line.strip().partition(": ")
+            if sep:
+                f[k] = v.strip()
+        size = f.get("Size", "")
+        if not size or "No Module" in size:
+            continue
+        speed = f.get("Configured Memory Speed") or f.get("Speed") or ""
+        mods.append({"slot": f.get("Locator", "?"), "bank": f.get("Bank Locator", ""), "size": size, "type": f.get("Type", ""),
+                     "speed": speed.split()[0] if speed[:1].isdigit() else "",
+                     "maker": f.get("Manufacturer", ""), "part": f.get("Part Number", "")})
+    # Some boards give every module the same Locator; then add the bank (channel) to tell them apart
+    slots = [m["slot"] for m in mods]
+    for m in mods:
+        if slots.count(m["slot"]) > 1 and m["bank"]:
+            m["slot"] = f"{m['slot']} ({m['bank']})"
+    return mods
+
+
+def session_type():
+    users = desktop_users()
+    if not users:
+        return None
+    _, out, _ = run("loginctl", "show-user", users[0][0], "-p", "Display", "--value")
+    if not out.strip():
+        return None
+    _, out, _ = run("loginctl", "show-session", out.strip(), "-p", "Type", "--value")
+    return out.strip().capitalize() or None
+
+
+def check_sysinfo():
+    details = []
+    osr = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', read("/etc/os-release"), re.M))
+    os_name = osr.get("PRETTY_NAME") or osr.get("NAME") or "Linux"
+    kernel = os.uname().release
+    details.append(f"Computer: {read('/proc/sys/kernel/hostname')}")
+    details.append(f"OS: {os_name}, kernel {kernel}")
+    for pkg, desktop in (("plasma-workspace", "KDE Plasma"), ("gnome-shell", "GNOME"), ("xfce4-session", "Xfce"),
+                         ("cinnamon", "Cinnamon"), ("hyprland", "Hyprland"), ("sway", "Sway")):
+        ver = pkg_version(pkg)
+        if ver:
+            st = session_type()
+            details.append(f"Desktop: {desktop} {ver}" + (f" ({st})" if st else ""))
+            break
+
+    cpuinfo = read("/proc/cpuinfo")
+    cpu = (re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M) or [None, "Unknown CPU"])[1]
+    cores = len(set(re.findall(r"^physical id\s*:\s*(\d+).*?^core id\s*:\s*(\d+)", cpuinfo, re.M | re.S)))
+    maxf = read("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    line = f"CPU: {cpu}, {cores} cores / {os.cpu_count()} threads" if cores else f"CPU: {cpu}"
+    if maxf.isdigit():
+        line += f", up to {int(maxf) / 1e6:.2f} GHz"
+    details.append(line)
+
+    gpus = list_gpus()
+    for g in gpus:
+        line = f"GPU: {g['name']}"
+        vram = (f"{round(g['vram'] / 1024 ** 3)} GB" if g["vram"] >= 1024 ** 3 else f"{g['vram'] // 1024 ** 2} MB") + " VRAM"
+        extra = [x for x in (g["maker"], vram if g["vram"] else "",
+                             "driver " + g["driver"] if g["driver"] else "") if x]
+        details.append(line + (f" ({', '.join(extra)})" if extra else ""))
+    mesa = pkg_version("mesa")
+    if mesa:
+        details.append(f"Graphics driver: Mesa {mesa}")
+
+    total = int(re.search(r"MemTotal:\s+(\d+)", read("/proc/meminfo")).group(1)) * 1024
+    mods = memory_modules()
+    groups = {}
+    for m in mods:
+        key = f"{m['size']} {m['type']}" + (f"-{m['speed']}" if m["speed"] else "")
+        groups[key] = groups.get(key, 0) + 1
+    ram = f"RAM: {human(total)} usable"
+    if groups:
+        ram += " (" + ", ".join(f"{n}x {k}" for k, n in groups.items()) + ")"
+    details.append(ram)
+    for m in mods:
+        details.append(f"    {m['slot']}: {m['size']} {m['type']} {m['speed']} MT/s, {m['maker']} {m['part']}".rstrip())
+
+    board = " ".join(x for x in (read("/sys/class/dmi/id/board_vendor"), read("/sys/class/dmi/id/board_name")) if x)
+    if board:
+        details.append(f"Mainboard: {board}, BIOS {read('/sys/class/dmi/id/bios_version')} "
+                       f"({read('/sys/class/dmi/id/bios_date')})")
+
+    up = float(read("/proc/uptime", "0").split()[0])
+    details.append(f"Running for: {duration(up)} (since {time.strftime('%Y-%m-%d %H:%M', time.localtime(time.time() - up))})")
+    _, out, _ = run("pacman", "-Q")
+    _, aur, _ = run("pacman", "-Qm")
+    details.append(f"Packages: {len(out.splitlines())} installed, {len(aur.splitlines())} from AUR/other sources")
+
+    installed = sum(int(m["size"].split()[0]) * (1024 if m["size"].split()[1:] == ["TB"] else 1)
+                    for m in mods if m["size"].split()[0].isdigit())
+    ram_short = f"{installed} GB" if installed else human(total)
+    cpu_short = re.sub(r"\s+\d+-Core Processor$", "", cpu).replace("AMD ", "")
+    summary = f"{os_name}, {cpu_short}, " + (f"{gpus[0]['name'].split(' ', 1)[-1]}, " if gpus else "") + f"{ram_short} RAM"
+    return result("sysinfo", "System info", OK, summary, details, info=True)
+
+
+# ---------------------------------------------------------------- resources
+def proc_sample():
+    data = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+                s = f.read()
+        except OSError:
+            continue
+        rest = s[s.rindex(")") + 2:].split()
+        data[pid] = (s[s.index("(") + 1:s.rindex(")")], int(rest[11]) + int(rest[12]), int(rest[21]))
+    return data
+
+
+def cpu_times():
+    vals = [int(x) for x in read("/proc/stat").splitlines()[0].split()[1:9]]
+    return vals[3] + vals[4], sum(vals)  # idle + iowait, total
+
+
+def check_resources():
+    idle1, total1 = cpu_times()
+    a, t1 = proc_sample(), time.monotonic()
+    time.sleep(1)
+    idle2, total2 = cpu_times()
+    b, t2 = proc_sample(), time.monotonic()
+    cpu_pct = 100 * (1 - (idle2 - idle1) / max(total2 - total1, 1))
+
+    ticks = os.sysconf("SC_CLK_TCK") * (t2 - t1) * os.cpu_count()
+    page = os.sysconf("SC_PAGE_SIZE")
+    cpu_by, mem_by = {}, {}
+    for pid, (name, t, rss) in b.items():
+        if pid in a and a[pid][0] == name:
+            cpu_by[name] = cpu_by.get(name, 0) + 100 * (t - a[pid][1]) / ticks
+        mem_by[name] = mem_by.get(name, 0) + rss * page
+
+    mi = {k: int(v) * 1024 for k, v in re.findall(r"^(\w+):\s+(\d+)", read("/proc/meminfo"), re.M)}
+    total, avail = mi["MemTotal"], mi["MemAvailable"]
+    used = total - avail
+    avail_pct = avail * 100 / total
+    swap_total, swap_used = mi.get("SwapTotal", 0), mi.get("SwapTotal", 0) - mi.get("SwapFree", 0)
+    load = read("/proc/loadavg").split()[:3]
+
+    st = FAIL if avail_pct < 5 else WARN if avail_pct < 10 else OK
+    if swap_total and swap_used / swap_total > 0.75:
+        st = worst(st, WARN)
+
+    swap_kind = " (zram)" if "zram" in read("/proc/swaps") else ""
+    details = [f"RAM: {human(used)} of {human(total)} used ({100 - avail_pct:.0f}%), {human(avail)} available",
+               f"Swap{swap_kind}: {human(swap_used)} of {human(swap_total)} used" if swap_total else "Swap: none",
+               f"CPU usage: {cpu_pct:.0f}% (load average {' / '.join(load)} on {os.cpu_count()} threads)",
+               "Using the most memory (approx.):"]
+    for name, mem in sorted(mem_by.items(), key=lambda x: -x[1])[:5]:
+        details.append(f"    {name}: {human(mem)}")
+    busy = [(n, p) for n, p in sorted(cpu_by.items(), key=lambda x: -x[1])[:5] if p >= 0.5]
+    details.append("Using the most CPU:" if busy else "Using the most CPU: nothing busy")
+    for name, pct in busy:
+        details.append(f"    {name}: {pct:.1f}%")
+    details.append("Measured at check time")
+    summary = f"RAM {human(used)} / {human(total)} ({100 - avail_pct:.0f}%), CPU {cpu_pct:.0f}%"
+    r = result("resources", "Usage", st, summary, details)
+    r["gauges"] = [gauge("RAM", 100 - avail_pct, 90, 95), gauge("CPU", cpu_pct)]
+    if swap_total:
+        r["gauges"].append(gauge("Swap", swap_used * 100 / swap_total, 75))
+    return r
+
+
+# ---------------------------------------------------------------- drives
+def check_drives():
+    rc, out, _ = run("lsblk", "-J", "-d", "-b", "-o", "NAME,TYPE,TRAN,SIZE,MODEL")
+    disks = []
+    try:
+        for d in json.loads(out)["blockdevices"]:
+            if d.get("type") == "disk" and d.get("tran") in ("nvme", "sata") and int(d.get("size") or 0) > 0:
+                disks.append(d)
+    except (ValueError, KeyError):
+        return result("drives", "Drives", WARN, "Could not list drives")
+
+    states, details = [], []
+    for d in disks:
+        dev = "/dev/" + d["name"]
+        model = (d.get("model") or d["name"]).strip()
+        _, out, _ = run("smartctl", "-j", "-a", dev)
+        try:
+            s = json.loads(out)
+        except ValueError:
+            states.append(WARN)
+            details.append(f"{model}: SMART data not readable")
+            continue
+
+        # Bits 0/1 of the exit status: command line error / device could not be opened
+        if (s.get("smartctl") or {}).get("exit_status", 0) & 0b11:
+            states.append(WARN)
+            details.append(f"{model} ({d['name']}): SMART data not readable")
+            continue
+
+        st = OK
+        notes, extra = [], []
+        passed = (s.get("smart_status") or {}).get("passed")
+        if passed is False:
+            st = FAIL
+            notes.append("SMART self-assessment FAILED")
+
+        temp = (s.get("temperature") or {}).get("current")
+        nv = s.get("nvme_smart_health_information_log")
+        if nv:
+            used = nv.get("percentage_used")
+            if used is not None:
+                notes.append(f"{used}% worn")
+                if used >= 90:
+                    st = worst(st, FAIL)
+                elif used >= 75:
+                    st = worst(st, WARN)
+            if nv.get("critical_warning"):
+                st = worst(st, FAIL)
+                notes.append(f"critical warning flag {nv['critical_warning']}")
+            if nv.get("media_errors"):
+                st = worst(st, WARN)
+                notes.append(f"{nv['media_errors']} media errors")
+            spare, thresh = nv.get("available_spare"), nv.get("available_spare_threshold")
+            if spare is not None and thresh is not None and spare <= thresh:
+                st = worst(st, FAIL)
+                notes.append(f"spare blocks low ({spare}%)")
+            if temp is None:
+                temp = nv.get("temperature")
+            if nv.get("power_on_hours") is not None:
+                extra.append(f"{nv['power_on_hours']:,} h powered on")
+            if nv.get("data_units_written"):
+                extra.append(f"{nv['data_units_written'] * 512000 / 1e12:.1f} TB written")
+            if nv.get("power_cycles") is not None:
+                extra.append(f"{nv['power_cycles']:,} power cycles")
+            if nv.get("unsafe_shutdowns"):
+                extra.append(f"{nv['unsafe_shutdowns']:,} unsafe shutdowns")
+        else:
+            attrs = {a.get("id"): a for a in (s.get("ata_smart_attributes") or {}).get("table", [])}
+            for aid, label in ((5, "reallocated sectors"), (197, "pending sectors"), (198, "uncorrectable sectors")):
+                raw = ((attrs.get(aid) or {}).get("raw") or {}).get("value")
+                if raw:
+                    st = worst(st, WARN)
+                    notes.append(f"{raw} {label}")
+            wear = attrs.get(177) or attrs.get(231) or attrs.get(233)
+            if wear and wear.get("value") is not None:
+                left = int(wear["value"])
+                notes.append(f"{100 - left}% worn")
+                if left <= 10:
+                    st = worst(st, FAIL)
+                elif left <= 25:
+                    st = worst(st, WARN)
+            hours = (s.get("power_on_time") or {}).get("hours")
+            if hours is not None:
+                extra.append(f"{hours:,} h powered on")
+            lbas = attrs.get(241) or {}
+            if lbas.get("name") == "Total_LBAs_Written" and (lbas.get("raw") or {}).get("value"):
+                extra.append(f"{lbas['raw']['value'] * 512 / 1e12:.1f} TB written")
+            if s.get("power_cycle_count") is not None:
+                extra.append(f"{s['power_cycle_count']:,} power cycles")
+        if temp is not None:
+            notes.append(f"{temp} °C")
+            if temp >= 75:
+                st = worst(st, WARN)
+        states.append(st)
+        details.append(f"{model} ({d['name']}, {int(d['size']) / 1e9:.0f} GB): " + ", ".join(notes))
+        if extra:
+            details.append("    " + ", ".join(extra))
+
+    status = worst(*states)
+    summary = {OK: f"{len(disks)} drives healthy", WARN: "A drive needs attention", FAIL: "A drive is failing"}[status]
+    return result("drives", "Drives", status, summary, details)
+
+
+# ---------------------------------------------------------------- btrfs
+def real_mounts():
+    """One entry per real filesystem: (mountpoint, source device, fstype)."""
+    _, out, _ = run("findmnt", "-J", "-l", "-o", "TARGET,SOURCE,FSTYPE", "-t", "btrfs,ext4,xfs,vfat")
+    seen, mounts = set(), []
+    try:
+        for m in json.loads(out)["filesystems"]:
+            dev = re.sub(r"\[.*\]$", "", m["source"])
+            if dev in seen:
+                continue
+            seen.add(dev)
+            mounts.append((m["target"], dev, m["fstype"]))
+    except (ValueError, KeyError):
+        pass
+    return mounts
+
+
+def check_btrfs():
+    states, details = [], []
+    for target, dev, fstype in real_mounts():
+        if fstype != "btrfs":
+            continue
+        rc, out, _ = run("btrfs", "device", "stats", target)
+        if rc != 0 or not out.strip():
+            states.append(WARN)
+            details.append(f"{target}: error counters not readable")
+            continue
+        errors = {}
+        for line in out.splitlines():
+            m = re.match(r"\[(.+)\]\.(\w+)\s+(\d+)", line)
+            if m and int(m.group(3)) > 0:
+                errors[m.group(2)] = int(m.group(3))
+        if errors:
+            states.append(FAIL if any(k in errors for k in ("corruption_errs", "read_io_errs", "write_io_errs")) else WARN)
+            details.append(f"{target}: " + ", ".join(f"{k} {v}" for k, v in errors.items()))
+        else:
+            states.append(OK)
+            details.append(f"{target}: no errors")
+    if not states:
+        return result("btrfs", "Filesystems", OK, "No Btrfs filesystems found")
+    status = worst(*states)
+    summary = {OK: "No filesystem errors", WARN: "Filesystem warnings found", FAIL: "Filesystem errors found"}[status]
+    return result("btrfs", "Filesystems", status, summary, details)
+
+
+# ---------------------------------------------------------------- disk space
+def check_space():
+    states, details, parts, gauges = [], [], [], []
+    for target, dev, fstype in real_mounts():
+        try:
+            du = shutil.disk_usage(target)
+        except OSError:
+            continue
+        pct = du.used * 100 // du.total
+        limit_warn, limit_fail = (80, 90) if target == "/boot" else (85, 95)
+        st = FAIL if pct >= limit_fail else WARN if pct >= limit_warn else OK
+        states.append(st)
+        name = "System" if target == "/" else target
+        details.append(f"{name}: {pct}% used, {human(du.free)} free")
+        parts.append(f"{name} {pct}%")
+        gauges.append(gauge(name, du.used * 100 / du.total, limit_warn, limit_fail))
+    status = worst(*states)
+    r = result("space", "Disk space", status, ", ".join(parts), details)
+    r["gauges"] = gauges
+    return r
+
+
+# ---------------------------------------------------------------- services
+def check_services():
+    _, out, _ = run("systemctl", "--failed", "--plain", "--no-legend")
+    failed = [l.split()[0] for l in out.splitlines() if l.strip()]
+    for user, _ in desktop_users():
+        _, uout, _ = run("systemctl", "--user", f"--machine={user}@.host", "--failed", "--plain", "--no-legend")
+        # app-*.service units are just launched programs that exited with an error, not real services
+        failed += [f"{l.split()[0]} (user {user})" for l in uout.splitlines()
+                   if l.strip() and not l.split()[0].startswith("app-")]
+    if failed:
+        boot = read("/proc/sys/kernel/random/boot_id")
+        return result("services", "Services", WARN, f"{len(failed)} failed service(s)", failed,
+                      events=[{"key": f"{boot}:{u}", "label": u} for u in failed])
+    return result("services", "Services", OK, "All services running")
+
+
+# ---------------------------------------------------------------- crashes
+def check_crashes():
+    _, out, _ = run("coredumpctl", "list", "--since=-24h", "--json=short", "--no-pager")
+    try:
+        dumps = json.loads(out) if out.strip() else []
+    except ValueError:
+        dumps = []
+    if not dumps:
+        return result("crashes", "Crashes", OK, "No crashes in the last 24 h")
+    # Ignore the login screen: its audio stack often crashes harmlessly when it shuts down after login
+    dm_uids = set()
+    for name in DISPLAY_MANAGER_USERS:
+        try:
+            dm_uids.add(pwd.getpwnam(name).pw_uid)
+        except KeyError:
+            pass
+    dumps = [d for d in dumps if d.get("uid") not in dm_uids]
+    if not dumps:
+        return result("crashes", "Crashes", OK, "No crashes in the last 24 h")
+    counts = {}
+    for d in dumps:
+        exe = os.path.basename(d.get("exe") or "unknown")
+        counts[exe] = counts.get(exe, 0) + 1
+    details = [f"{exe}: {n}x" for exe, n in sorted(counts.items(), key=lambda x: -x[1])]
+    events = []
+    for d in dumps:
+        when = time.strftime("%H:%M", time.localtime((d.get("time") or 0) / 1e6))
+        events.append({"key": f"{d.get('time')}:{d.get('pid')}",
+                       "label": f"{os.path.basename(d.get('exe') or 'unknown')} at {when}"})
+    return result("crashes", "Crashes", WARN, f"{len(dumps)} crash(es) in the last 24 h ({', '.join(list(counts)[:3])})",
+                  details, events=events)
+
+
+# ---------------------------------------------------------------- updates
+def last_upgrade():
+    try:
+        with open("/var/log/pacman.log", encoding="utf-8", errors="replace") as f:
+            lines = [l for l in f if "starting full system upgrade" in l]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    m = re.match(r"\[(\S+)\]", lines[-1])
+    if not m:
+        return None
+    rc, out, _ = run("date", "-d", m.group(1), "+%s")
+    return int(out.strip()) if rc == 0 and out.strip().isdigit() else None
+
+
+def check_updates():
+    rc, out, _ = run("checkupdates", timeout=180)
+    pending = len([l for l in out.splitlines() if l.strip()]) if rc == 0 else 0
+    last = last_upgrade()
+    details = []
+    st = OK
+    if rc not in (0, 2):
+        details.append("Could not check for updates (offline?)")
+    if last:
+        days = (time.time() - last) / 86400
+        details.append(f"Last full upgrade: {ago(time.time() - last)}")
+        if days > 21:
+            st = WARN
+    summary = f"{pending} update(s) available" if pending else "System is up to date"
+    if last:
+        summary += f", last upgrade {ago(time.time() - last)}"
+    if pending:
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        details.append("Waiting to be installed:")
+        details += ["    " + l for l in lines[:30]]
+        if len(lines) > 30:
+            details.append(f"    ...and {len(lines) - 30} more")
+    return result("updates", "Updates", st, summary, details)
+
+
+# ---------------------------------------------------------------- temperatures
+def check_temps():
+    _, out, _ = run("sensors", "-j")
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return result("temps", "Temperatures", WARN, "Could not read sensors")
+    def get(sensor, suffix):
+        for k, v in (sensor or {}).items():
+            if k.endswith(suffix):
+                return v
+        return None
+
+    def level(value, warn_at, fail_at):
+        return FAIL if value >= fail_at else WARN if value >= warn_at else OK
+
+    names = {"mt7925": "Wi-Fi chip", "mt7921": "Wi-Fi chip", "iwlwifi": "Wi-Fi chip", "prom21_xhci": "USB controller"}
+    st = OK
+    parts, cpu_lines, gpu_lines, ram, other = [], [], [], [], []
+    for chip in sorted(data):
+        vals = data[chip]
+        base = chip.split("-")[0]
+        if base == "k10temp" and "Tctl" in vals:
+            cpu = get(vals["Tctl"], "_input")
+            ccds = [f"{k[1:].upper()} {get(v, '_input'):.0f} °C" for k, v in vals.items()
+                    if k.startswith("Tccd") and get(v, "_input") is not None]
+            parts.insert(0, f"CPU {cpu:.0f} °C")
+            cpu_lines.append(f"CPU: {cpu:.0f} °C" + (f" ({', '.join(ccds)})" if ccds else ""))
+            st = worst(st, level(cpu, 85, 95))
+        elif base == "amdgpu" and "junction" in vals:
+            edge = get(vals.get("edge"), "_input")
+            line = f"GPU: {edge:.0f} °C" if edge is not None else "GPU:"
+            if edge is not None:
+                parts.append(f"GPU {edge:.0f} °C")
+                st = worst(st, level(edge, 90, 100))
+            for key, label in (("junction", "hotspot"), ("mem", "VRAM")):
+                v, crit = get(vals.get(key), "_input"), get(vals.get(key), "_crit")
+                if v is not None:
+                    line += f", {label} {v:.0f} °C"
+                    if crit:
+                        st = worst(st, level(v, crit - 10, crit))
+            fan = get(vals.get("fan1"), "_input")
+            if fan is not None:
+                line += f", fan {fan:.0f} RPM" + (" (stopped at idle)" if fan == 0 else "")
+            power = get(vals.get("PPT"), "_average") or get(vals.get("PPT"), "_input")
+            if power is not None:
+                line += f", {power:.0f} W"
+            clock = get(vals.get("sclk"), "_input")
+            if clock:
+                line += f", {clock / 1e6:.0f} MHz"
+            gpu_lines.insert(0, line)
+        elif base == "amdgpu":
+            edge = get(vals.get("edge"), "_input")
+            if edge is not None:
+                gpu_lines.append(f"Integrated GPU: {edge:.0f} °C")
+        elif base == "spd5118":
+            v, crit = get(vals.get("temp1"), "_input"), get(vals.get("temp1"), "_crit")
+            if v is not None:
+                ram.append(f"{v:.0f} °C")
+                if crit:
+                    st = worst(st, level(v, crit - 15, crit))
+        elif base != "nvme":  # drive temperatures are shown under Drives
+            for sensor in vals.values():
+                v = get(sensor, "_input") if isinstance(sensor, dict) else None
+                if v is not None and any(k.startswith("temp") for k in sensor):
+                    label = next((n for k, n in names.items() if base.startswith(k)), base)
+                    other.append(f"{label}: {v:.0f} °C")
+                    break
+    details = cpu_lines + gpu_lines
+    if ram:
+        details.append(f"RAM modules: {', '.join(ram)}")
+    details += other + ["Measured at check time"]
+    return result("temps", "Temperatures", st, ", ".join(parts) or "No sensors found", details)
+
+
+# ---------------------------------------------------------------- system log
+LOG_PATTERNS = [
+    (r"\[Hardware Error\]", FAIL, "hardware error (CPU/RAM)"),
+    (r"BTRFS (error|critical)", FAIL, "Btrfs error"),
+    (r"amdgpu.*(ring \S+ timeout|GPU reset begin|GPU hang)", WARN, "GPU hang/reset"),
+    (r"\bI/O error\b", WARN, "disk I/O error"),
+    (r"nvme.*(timeout|controller is down|resetting controller)", WARN, "NVMe timeout/reset"),
+    (r"Out of memory: Killed process", WARN, "out-of-memory kill"),
+]
+# Kernel "errors" that are known to be harmless
+LOG_IGNORE = [r"TDX not supported"]
+
+
+def check_logs():
+    boot = read("/proc/sys/kernel/random/boot_id")
+    _, kall, _ = run("journalctl", "-k", "-b", "-q", "--no-pager", "-o", "cat")
+    found = {}
+    for line in kall.splitlines():
+        for pat, level, label in LOG_PATTERNS:
+            if re.search(pat, line, re.I):
+                found.setdefault((label, level), []).append(line.strip())
+                break
+    flagged = {l for lines in found.values() for l in lines}
+
+    _, kerr, _ = run("journalctl", "-k", "-b", "-p", "3", "-q", "--no-pager", "-o", "cat")
+    kernel_errors = [l.strip() for l in kerr.splitlines() if l.strip() and l.strip() not in flagged
+                     and not any(re.search(p, l) for p in LOG_IGNORE)]
+
+    _, uerr, _ = run("journalctl", "-b", "-p", "3", "-q", "--no-pager", "-o", "json",
+                     "--output-fields=SYSLOG_IDENTIFIER,_COMM,_TRANSPORT")
+    senders = {}
+    for line in uerr.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("_TRANSPORT") == "kernel":
+            continue
+        who = e.get("SYSLOG_IDENTIFIER") or e.get("_COMM") or "unknown"
+        who = who if isinstance(who, str) else "unknown"
+        senders[who] = senders.get(who, 0) + 1
+
+    st, details, keys = OK, [], []
+    for (label, level), lines in found.items():
+        st = worst(st, level)
+        details.append(f"{len(lines)}x {label}:")
+        details += ["    " + l[:180] for l in lines[:3]]
+        keys += [{"key": f"{boot}:{l}", "label": label} for l in lines]
+    details.append(f"Other kernel errors: {len(kernel_errors)}")
+    details += ["    " + l[:180] for l in kernel_errors[:5]]
+    n_user = sum(senders.values())
+    top = ", ".join(f"{k} {v}x" for k, v in sorted(senders.items(), key=lambda x: -x[1])[:6])
+    details.append(f"Program errors: {n_user}" + (f" ({top})" if top else ""))
+    details.append("Since the last boot")
+
+    if found:
+        summary = ", ".join(f"{len(v)}x {k[0]}" for k, v in found.items())
+    else:
+        summary = "No serious errors since boot"
+        if kernel_errors:
+            summary += f" ({len(kernel_errors)} minor kernel message(s))"
+    return result("logs", "System log", st, summary, details, events=keys)
+
+
+# ---------------------------------------------------------------- maintenance
+def check_maintenance():
+    st, details, parts = OK, [], []
+    pacnew = []
+    for root, _, files in os.walk("/etc", onerror=lambda e: None):
+        pacnew += [os.path.join(root, f) for f in files if f.endswith(".pacnew")]
+    if pacnew:  # shown as information only, never a warning
+        parts.append(f"{len(pacnew)} config update(s) to review")
+        details.append(f"New config file versions (.pacnew) waiting: {len(pacnew)}, review with: sudo pacdiff")
+        details += ["    " + p for p in sorted(pacnew)]
+
+    cache = 0
+    try:
+        with os.scandir("/var/cache/pacman/pkg") as it:
+            for e in it:
+                if e.is_file(follow_symlinks=False):
+                    cache += e.stat(follow_symlinks=False).st_size
+    except OSError:
+        pass
+    if cache > 20 * 1024 ** 3:
+        st = WARN
+    parts.append(f"package cache {human(cache)}")
+    details.append(f"Package cache: {human(cache)}" + (", clean up with: sudo paccache -rk1" if cache > 5 * 1024 ** 3 else ""))
+
+    _, out, _ = run("pacman", "-Qdtq")
+    orphans = out.split()
+    if orphans:
+        parts.append(f"{len(orphans)} unneeded package(s)")
+        details.append(f"Unneeded packages (orphans): {len(orphans)}, remove with: pacman -Qdtq | sudo pacman -Rns -")
+        details.append("    " + ", ".join(orphans[:15]) + (" ..." if len(orphans) > 15 else ""))
+    else:
+        details.append("Unneeded packages (orphans): none")
+    summary = ", ".join(parts)
+    return result("maintenance", "Maintenance", st, summary[:1].upper() + summary[1:], details)
+
+
+# ---------------------------------------------------------------- main
+def notify(title, body, urgency):
+    for user, uid in desktop_users():
+        run("runuser", "-u", user, "--", "env", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+            "notify-send", "-a", "System Doctor", "-u", urgency, "-i", "utilities-system-monitor", title, body)
+
+
+def main():
+    if "--version" in sys.argv:
+        print(f"system-doctor {VERSION}")
+        return
+    if os.geteuid() != 0:
+        print("system-doctor must run as root. Start a check with: doctor now")
+        raise SystemExit(1)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.chmod(STATE_DIR, 0o755)
+    previous = {}
+    try:
+        with open(REPORT, encoding="utf-8") as f:
+            previous = {c["id"]: c for c in json.load(f).get("checks", [])}
+    except (OSError, ValueError, KeyError):
+        pass
+
+    # Usage is measured first so the other checks do not show up as CPU load
+    resources = check_resources()
+    checks = [check_sysinfo(), resources, check_drives(), check_btrfs(), check_space(), check_temps(),
+              check_services(), check_crashes(), check_logs(), check_updates(), check_maintenance()]
+    overall = worst(*(c["status"] for c in checks))
+    report = {"version": VERSION, "time": int(time.time()), "overall": overall, "checks": checks}
+
+    tmp = REPORT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, REPORT)
+
+    # Notify only about problems that are new or got worse since the last check.
+    # Checks with event keys (crashes) also notify when a new event appears.
+    def is_new(c):
+        if c["status"] == OK:
+            return False
+        prev = previous.get(c["id"]) or {}
+        if RANK[c["status"]] > RANK[prev.get("status", OK)]:
+            return True
+        return bool(set(c.get("keys", [])) - set(prev.get("keys", [])))
+    new = [c for c in checks if is_new(c)]
+    if new:
+        urgency = "critical" if any(c["status"] == FAIL for c in new) else "normal"
+        body = "\n".join(f"{c['title']}: {c['summary']}" for c in new)
+        notify(f"System Doctor: {len(new)} new issue(s)", body, urgency)
+
+    for c in checks:
+        print(f"[{c['status'].upper():4}] {c['title']}: {c['summary']}")
+
+
+if __name__ == "__main__":
+    main()
