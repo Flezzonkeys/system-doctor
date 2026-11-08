@@ -2,11 +2,8 @@
 
 <h1 align="center">System Doctor</h1>
 
-A daily health check for Arch-based Linux systems (Arch, CachyOS, EndeavourOS, Manjaro and others),
-with a clear dashboard and desktop notifications when something goes wrong.
-
-System Doctor runs quietly in the background 10 minutes after boot and once a day. It only
-notifies you when a problem is **new or got worse**, so you are not bothered by the same message every day.
+<p align="center">A daily health check for Arch-based Linux with a clean dashboard.<br>
+It notifies you only when something <b>new</b> goes wrong.</p>
 
 ![Dashboard](screenshots/dashboard.png)
 
@@ -16,129 +13,97 @@ notifies you when a problem is **new or got worse**, so you are not bothered by 
 ![Dashboard in the light theme](screenshots/dashboard-light.png)
 </details>
 
-## Highlights
+## Features
 
-- **Dashboard** with one card per area. Click a card to see everything about it.
-- **Dark and light theme.** Dark is the default, switch with one click (or `Ctrl+T`). The choice is remembered.
-- **Mark warnings as seen.** Crashes, failed services and log errors you already know about can be
-  hidden with *Mark as seen*. The warning comes back only when something **new** happens.
-  *Show again* brings them back.
-- **Notifications only for news.** You get a desktop notification when a problem is new or got worse,
-  not every day for the same thing.
+- One card per area, click it for all details
+- Dark and light theme (`Ctrl+T`)
+- Mark known warnings as seen, they only come back when something new happens
+- Runs by itself 10 minutes after boot and once a day
+- Only reads your system, never changes anything
 
 ## What it checks
 
-| Section | What you see | Warns when |
-|---|---|---|
-| **System info** | OS, kernel, desktop, CPU, GPUs with VRAM, Mesa, RAM modules, mainboard and BIOS, uptime, packages | never (information only) |
-| **Usage** | RAM, swap and CPU usage, the programs using the most memory and CPU | RAM almost full, swap mostly used |
-| **Drives** | SMART health of every NVMe/SATA drive: wear, temperature, power-on hours, TB written, unsafe shutdowns | SMART failure, high wear, media errors, low spare blocks, hot drive |
-| **Filesystems** | Btrfs error counters | read/write/corruption errors |
-| **Disk space** | Fill level of every mounted filesystem | over 85 % (over 80 % for `/boot`) |
-| **Temperatures** | CPU and CCDs, GPU edge/hotspot/VRAM, fan, power and clock, iGPU, RAM modules, Wi-Fi, USB | CPU, GPU or RAM running hot |
-| **Services** | Failed system and user services | any failed service |
-| **Crashes** | Programs that crashed in the last 24 hours (`coredumpctl`) | any crash |
-| **System log** | Kernel log since boot: hardware errors (MCE), GPU hangs/resets, disk I/O errors, NVMe timeouts, out-of-memory kills | any of these |
-| **Updates** | Pending updates and when the last full upgrade ran | no full upgrade for 3 weeks |
-| **Maintenance** | `.pacnew` files, package cache size, orphaned packages | package cache over 20 GB |
+| Area | Details |
+|---|---|
+| **System info** | OS, kernel, desktop, CPU, GPU, RAM modules, mainboard, BIOS |
+| **Usage** | RAM, swap, CPU and the hungriest programs |
+| **Drives** | SMART health, wear, temperature, hours, TB written |
+| **Filesystems** | Btrfs error counters |
+| **Disk space** | Fill level of every drive |
+| **Temperatures** | CPU, GPU (hotspot, VRAM, fan, power), RAM, Wi-Fi, USB |
+| **Services** | Failed system and user services |
+| **Crashes** | Programs that crashed in the last 24 hours |
+| **System log** | Hardware errors, GPU resets, disk I/O errors, out-of-memory kills |
+| **Updates** | Pending updates and the last full upgrade |
+| **Maintenance** | `.pacnew` files, package cache, orphaned packages |
 
 ## Install
 
-Works on Arch-based systems with systemd (Arch, CachyOS, EndeavourOS, Manjaro, ...).
-Open a terminal and run these steps one by one.
+For Arch-based systems (Arch, CachyOS, EndeavourOS, Manjaro, ...). Run the steps one by one in a terminal.
 
-**1. Install git** (skip this if you already have it)
-
+**1. Install git** (if you don't have it)
 ```bash
 sudo pacman -S --needed git
 ```
 
-**2. Download System Doctor**
-
+**2. Download**
 ```bash
 git clone https://github.com/Flezzonkeys/system-doctor.git
 ```
 
 **3. Go into the folder**
-
 ```bash
 cd system-doctor
 ```
 
-**4. Run the installer**
-
+**4. Install** (missing packages are installed automatically after asking)
 ```bash
 sudo bash install.sh
 ```
 
-The installer checks for the packages System Doctor needs and offers to install the missing ones
-(`python`, `python-pyqt6`, `smartmontools`, `lm_sensors`, `pacman-contrib`, `dmidecode`, `libnotify`,
-`pciutils`). Then it copies the programs to `/usr/local/bin`, enables a daily timer and runs the first check.
+Done. Open *System Doctor* from your app menu.
 
-**5. Open it**
-
-Start *System Doctor* from your app menu, or type:
-
-```bash
-doctor
-```
-
-### Update to a new version
+## Update
 
 ```bash
 cd system-doctor
 ```
-
 ```bash
 git pull
 ```
-
 ```bash
 sudo bash install.sh
 ```
 
-## Usage
-
-- **Window:** open *System Doctor* from the app menu. Click a card to see its details on the right.
-
-  | Key | Action |
-  |---|---|
-  | `F5` | Run a new check |
-  | `Ctrl+T` | Switch between dark and light theme |
-  | `Ctrl+C` | Copy the selected section as text (handy for bug reports) |
-  | `Ctrl+Q` | Quit |
-
-- **Terminal:**
-
-  ```text
-  doctor        show the latest health report
-  doctor now    run a new check and show the result
-  doctor all    show the latest report with all details
-  doctor clear  mark the current crash, log and service warnings as seen
-  doctor gui    open the System Doctor window
-  ```
-
-## How it works
-
-| Part | Purpose |
-|---|---|
-| `src/system-doctor` | The checker. Runs as root through `system-doctor.service`, writes `/var/lib/system-doctor/report.json` and sends notifications to logged-in users. |
-| `src/system-doctor-gui` | The PyQt6 dashboard. Reads the report and can start a new check. |
-| `src/doctor` | Terminal front end. |
-| `data/system-doctor.timer` | Runs the check 10 minutes after boot and then once a day. |
-| `data/50-system-doctor.rules` | polkit rule that lets the logged-in local user start the check without a password. Nothing else is allowed. |
-
-Your theme choice and the warnings you marked as seen are stored per user in
-`~/.config/system-doctor/`.
-
-System Doctor only **reads** the state of your system. It never changes, repairs or deletes anything.
-Where a fix is simple, the details show the command to run yourself (for example `sudo paccache -rk1`).
-
 ## Uninstall
 
+**1. Go into the folder** (if you deleted it, download it again with step 2 of Install)
+```bash
+cd system-doctor
+```
+
+**2. Uninstall**
 ```bash
 sudo bash uninstall.sh
 ```
+
+**3. Optional: remove your settings and the downloaded folder**
+```bash
+rm -rf ~/.config/system-doctor
+```
+```bash
+cd .. && rm -rf system-doctor
+```
+
+## Terminal commands
+
+| Command | What it does |
+|---|---|
+| `doctor` | Show the latest report |
+| `doctor now` | Run a new check |
+| `doctor all` | Show all details |
+| `doctor clear` | Mark current warnings as seen |
+| `doctor gui` | Open the window |
 
 ## License
 
