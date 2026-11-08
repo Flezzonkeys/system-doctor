@@ -44,17 +44,58 @@ notifies you when a problem is **new or got worse**, so you are not bothered by 
 
 ## Install
 
-Requirements: an Arch-based system with systemd. The installer checks for these packages and offers to
-install what is missing: `python`, `python-pyqt6`, `smartmontools`, `lm_sensors`, `pacman-contrib`,
-`dmidecode`, `libnotify`, `pciutils`. `btrfs-progs` is used when Btrfs filesystems exist.
+Works on Arch-based systems with systemd (Arch, CachyOS, EndeavourOS, Manjaro, ...).
+Open a terminal and run these steps one by one.
+
+**1. Install git** (skip this if you already have it)
+
+```bash
+sudo pacman -S --needed git
+```
+
+**2. Download System Doctor**
 
 ```bash
 git clone https://github.com/Flezzonkeys/system-doctor.git
+```
+
+**3. Go into the folder**
+
+```bash
 cd system-doctor
+```
+
+**4. Run the installer**
+
+```bash
 sudo bash install.sh
 ```
 
-The installer copies the programs to `/usr/local/bin`, enables a systemd timer and runs the first check.
+The installer checks for the packages System Doctor needs and offers to install the missing ones
+(`python`, `python-pyqt6`, `smartmontools`, `lm_sensors`, `pacman-contrib`, `dmidecode`, `libnotify`,
+`pciutils`). Then it copies the programs to `/usr/local/bin`, enables a daily timer and runs the first check.
+
+**5. Open it**
+
+Start *System Doctor* from your app menu, or type:
+
+```bash
+doctor
+```
+
+### Update to a new version
+
+```bash
+cd system-doctor
+```
+
+```bash
+git pull
+```
+
+```bash
+sudo bash install.sh
+```
 
 ## Usage
 
